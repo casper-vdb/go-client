@@ -14,24 +14,23 @@ import (
 	"time"
 )
 
-// Client is a high–level HTTP/gRPC client for Casper vector database.
+// Client is a high–level HTTP client for the Casper vector database.
 type Client struct {
 	httpClient *http.Client
 	baseURL    *url.URL
-	grpcAddr   string
 }
 
 const defaultTimeout = 30 * time.Second
 
 // New creates a new Casper client with a default timeout.
 //
-// host is a URL including scheme, for example "http://localhost".
-func New(host string, httpPort, grpcPort int) (*Client, error) {
-	return NewWithTimeout(host, httpPort, grpcPort, defaultTimeout)
+// host is a URL including scheme, e.g. "http://localhost".
+func New(host string, httpPort int) (*Client, error) {
+	return NewWithTimeout(host, httpPort, defaultTimeout)
 }
 
 // NewWithTimeout creates a new Casper client with a custom timeout.
-func NewWithTimeout(host string, httpPort, grpcPort int, timeout time.Duration) (*Client, error) {
+func NewWithTimeout(host string, httpPort int, timeout time.Duration) (*Client, error) {
 	baseURLStr := fmt.Sprintf("%s:%d", host, httpPort)
 	u, err := url.Parse(baseURLStr)
 	if err != nil {
@@ -58,12 +57,9 @@ func NewWithTimeout(host string, httpPort, grpcPort int, timeout time.Duration) 
 		},
 	}
 
-	grpcAddr := fmt.Sprintf("%s:%d", host, grpcPort)
-
 	return &Client{
 		httpClient: httpClient,
 		baseURL:    u,
-		grpcAddr:   grpcAddr,
 	}, nil
 }
 
@@ -73,11 +69,6 @@ func (c *Client) BaseURL() string {
 		return ""
 	}
 	return c.baseURL.String()
-}
-
-// GRPCAddr returns the gRPC address used by the client.
-func (c *Client) GRPCAddr() string {
-	return c.grpcAddr
 }
 
 // ListCollections calls GET /collections.
@@ -132,7 +123,6 @@ func (c *Client) CreateCollection(ctx context.Context, collectionName string, re
 	if err != nil {
 		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	return c.doEmpty(req)
 }
@@ -150,20 +140,45 @@ func (c *Client) DeleteCollection(ctx context.Context, collectionName string) er
 	return c.doEmpty(req)
 }
 
-// InsertVector calls POST /collection/{name}/insert?id=..
-func (c *Client) InsertVector(ctx context.Context, collectionName string, request InsertRequest) error {
-	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/insert", url.PathEscape(collectionName)))
+// UpsertVectors calls PUT /collection/{name}/vectors with a batch of vector points.
+func (c *Client) UpsertVectors(ctx context.Context, collectionName string, vectors []VectorPoint) error {
+	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/vectors", url.PathEscape(collectionName)))
 	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "invalid insert URL", Cause: err}
+		return &Error{Kind: ErrorKindClient, Message: "invalid upsert URL", Cause: err}
 	}
-	q := u.Query()
-	q.Set("id", fmt.Sprintf("%d", request.ID))
-	u.RawQuery = q.Encode()
 
-	body := insertVectorBody{Vector: request.Vector}
+	if vectors == nil {
+		vectors = []VectorPoint{}
+	}
+	body := UpsertVectorsRequest{Vectors: vectors}
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to encode insert body", Cause: err}
+		return &Error{Kind: ErrorKindClient, Message: "failed to encode upsert body", Cause: err}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), bytes.NewReader(buf))
+	if err != nil {
+		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	return c.doEmpty(req)
+}
+
+// DeleteVectors calls POST /collection/{name}/vectors/delete with a list of ids.
+func (c *Client) DeleteVectors(ctx context.Context, collectionName string, ids []uint32) error {
+	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/vectors/delete", url.PathEscape(collectionName)))
+	if err != nil {
+		return &Error{Kind: ErrorKindClient, Message: "invalid delete URL", Cause: err}
+	}
+
+	if ids == nil {
+		ids = []uint32{}
+	}
+	body := DeleteVectorsRequest{Vectors: ids}
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return &Error{Kind: ErrorKindClient, Message: "failed to encode delete body", Cause: err}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(buf))
@@ -175,30 +190,16 @@ func (c *Client) InsertVector(ctx context.Context, collectionName string, reques
 	return c.doEmpty(req)
 }
 
-// DeleteVector calls DELETE /collection/{name}/delete?id=..
-func (c *Client) DeleteVector(ctx context.Context, collectionName string, request DeleteRequest) error {
-	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/delete", url.PathEscape(collectionName)))
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "invalid delete URL", Cause: err}
-	}
-	q := u.Query()
-	q.Set("id", fmt.Sprintf("%d", request.ID))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.doEmpty(req)
-}
-
 // Search performs a nearest–neighbour query and decodes the binary search response.
 //
-// It calls POST /collection/{name}/search?limit=.. with a JSON body { "vector": [...] }
-// and expects the default binary response format described in api.md.
+// It calls POST /collection/{name}/search?limit=.. with a JSON body { "vector": [...] }.
 func (c *Client) Search(ctx context.Context, collectionName string, query []float32, limit int) (SearchResponse, error) {
+	return c.SearchWithEf(ctx, collectionName, query, limit, 0)
+}
+
+// SearchWithEf is like Search but allows overriding the server-side ef_search
+// HNSW parameter. Pass efSearch <= 0 to fall back to the server default.
+func (c *Client) SearchWithEf(ctx context.Context, collectionName string, query []float32, limit int, efSearch int) (SearchResponse, error) {
 	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/search", url.PathEscape(collectionName)))
 	if err != nil {
 		return nil, &Error{Kind: ErrorKindClient, Message: "invalid search URL", Cause: err}
@@ -206,6 +207,9 @@ func (c *Client) Search(ctx context.Context, collectionName string, query []floa
 	q := u.Query()
 	q.Set("limit", fmt.Sprintf("%d", limit))
 	q.Set("output", "bin")
+	if efSearch > 0 {
+		q.Set("ef_search", fmt.Sprintf("%d", efSearch))
+	}
 	u.RawQuery = q.Encode()
 
 	body := searchVectorBody{Vector: query}
@@ -233,7 +237,6 @@ func (c *Client) Search(ctx context.Context, collectionName string, query []floa
 	}
 
 	if status < 200 || status >= 300 {
-		// Attempt to extract "error" field from JSON, fall back to raw body.
 		var jsonErr struct {
 			Error string `json:"error"`
 		}
@@ -253,7 +256,7 @@ func (c *Client) Search(ctx context.Context, collectionName string, query []floa
 	}
 
 	count := int(binary.LittleEndian.Uint32(bodyBytes[:4]))
-	expectedLen := 4 + count*(4+4)
+	expectedLen := 4 + count*8
 	if len(bodyBytes) < expectedLen {
 		return nil, &Error{
 			Kind:    ErrorKindInvalidResponse,
@@ -264,18 +267,12 @@ func (c *Client) Search(ctx context.Context, collectionName string, query []floa
 	results := make(SearchResponse, 0, count)
 	offset := 4
 	for i := 0; i < count; i++ {
-		if offset+8 > len(bodyBytes) {
-			return nil, &Error{
-				Kind:    ErrorKindInvalidResponse,
-				Message: "binary search response truncated while reading results",
-			}
-		}
 		id := binary.LittleEndian.Uint32(bodyBytes[offset : offset+4])
 		offset += 4
 		scoreBits := binary.LittleEndian.Uint32(bodyBytes[offset : offset+4])
 		offset += 4
 
-		score := float32FromBits(scoreBits)
+		score := math.Float32frombits(scoreBits)
 		results = append(results, SearchResult{
 			ID:    id,
 			Score: score,
@@ -350,7 +347,10 @@ func (c *Client) BatchUpdate(ctx context.Context, collectionName string, request
 	return c.doEmpty(req)
 }
 
-// CreateHNSWIndex calls POST /collection/{name}/index.
+// CreateHNSWIndex calls POST /collection/{name}/index. The server returns
+// 202 Accepted as soon as the build has been scheduled — the index build
+// itself runs asynchronously, so poll GetCollection.HasIndex when you need
+// to wait for completion.
 func (c *Client) CreateHNSWIndex(ctx context.Context, collectionName string, index HNSWIndex) error {
 	u, err := c.baseURL.Parse(fmt.Sprintf("collection/%s/index", url.PathEscape(collectionName)))
 	if err != nil {
@@ -409,131 +409,6 @@ func (c *Client) UnmuteCollection(ctx context.Context, collectionName string) er
 	return c.doEmpty(req)
 }
 
-// DeleteMatrix calls DELETE /matrix/{name}.
-func (c *Client) DeleteMatrix(ctx context.Context, name string) error {
-	u, err := c.baseURL.Parse(fmt.Sprintf("matrix/%s", url.PathEscape(name)))
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "invalid matrix URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return c.doEmpty(req)
-}
-
-// ListMatrices calls GET /matrix/list.
-func (c *Client) ListMatrices(ctx context.Context) ([]MatrixInfo, error) {
-	u, err := c.baseURL.Parse("matrix/list")
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "invalid matrix list URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	var out []MatrixInfo
-	if err := c.doJSON(req, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// GetMatrixInfo calls GET /matrix/{name}.
-func (c *Client) GetMatrixInfo(ctx context.Context, name string) (*MatrixInfo, error) {
-	u, err := c.baseURL.Parse(fmt.Sprintf("matrix/%s", url.PathEscape(name)))
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "invalid matrix URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	var out MatrixInfo
-	if err := c.doJSON(req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// CreatePQ calls POST /pq/{name}.
-func (c *Client) CreatePQ(ctx context.Context, name string, request CreatePQRequest) error {
-	u, err := c.baseURL.Parse(fmt.Sprintf("pq/%s", url.PathEscape(name)))
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "invalid PQ URL", Cause: err}
-	}
-	buf, err := json.Marshal(request)
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to encode PQ body", Cause: err}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(buf))
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.doEmpty(req)
-}
-
-// DeletePQ calls DELETE /pq/{name}.
-func (c *Client) DeletePQ(ctx context.Context, name string) error {
-	u, err := c.baseURL.Parse(fmt.Sprintf("pq/%s", url.PathEscape(name)))
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "invalid PQ URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
-	if err != nil {
-		return &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.doEmpty(req)
-}
-
-// ListPQs calls GET /pq/list.
-func (c *Client) ListPQs(ctx context.Context) ([]PQInfo, error) {
-	u, err := c.baseURL.Parse("pq/list")
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "invalid PQ list URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	var out []PQInfo
-	if err := c.doJSON(req, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// GetPQ calls GET /pq/{name}.
-func (c *Client) GetPQ(ctx context.Context, name string) (*PQInfo, error) {
-	u, err := c.baseURL.Parse(fmt.Sprintf("pq/%s", url.PathEscape(name)))
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "invalid PQ URL", Cause: err}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	var out PQInfo
-	if err := c.doJSON(req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
 // Health calls GET /health and returns an error if the service is not healthy.
 func (c *Client) Health(ctx context.Context) error {
 	u, err := c.baseURL.Parse("health")
@@ -556,11 +431,6 @@ func (c *Client) Health(ctx context.Context) error {
 		return classifyHTTPError(resp.StatusCode, string(bodyBytes))
 	}
 	return nil
-}
-
-// float32FromBits converts a uint32 into a float32.
-func float32FromBits(b uint32) float32 {
-	return math.Float32frombits(b)
 }
 
 // doJSON executes an HTTP request and decodes a JSON response body on success.
@@ -586,7 +456,6 @@ func (c *Client) doEmpty(req *http.Request) error {
 	}
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	// Try to parse JSON {"error": "..."} first
 	var jsonErr struct {
 		Error string `json:"error"`
 	}
@@ -616,7 +485,6 @@ func decodeJSONResponse(resp *http.Response, out any) error {
 		return nil
 	}
 
-	// Try to parse JSON error { "error": "..." }.
 	var jsonErr struct {
 		Error string `json:"error"`
 	}
