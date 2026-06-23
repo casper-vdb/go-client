@@ -409,6 +409,46 @@ func (c *Client) UnmuteCollection(ctx context.Context, collectionName string) er
 	return c.doEmpty(req)
 }
 
+// GetCluster calls GET /cluster and returns the node's role
+// (standalone/master/replica) and replication progress. Always inspect
+// the returned ClusterInfo.Role before reading role-specific fields.
+func (c *Client) GetCluster(ctx context.Context) (*ClusterInfo, error) {
+	u, err := c.baseURL.Parse("cluster")
+	if err != nil {
+		return nil, &Error{Kind: ErrorKindClient, Message: "invalid cluster URL", Cause: err}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
+	}
+
+	var out ClusterInfo
+	if err := c.doJSON(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetConfig calls GET /config and returns the runtime AppConfig the server
+// process started with. Configuration is immutable after startup; restart
+// the server to change a value.
+func (c *Client) GetConfig(ctx context.Context) (*AppConfig, error) {
+	u, err := c.baseURL.Parse("config")
+	if err != nil {
+		return nil, &Error{Kind: ErrorKindClient, Message: "invalid config URL", Cause: err}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, &Error{Kind: ErrorKindClient, Message: "failed to build request", Cause: err}
+	}
+
+	var out AppConfig
+	if err := c.doJSON(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Health calls GET /health and returns an error if the service is not healthy.
 func (c *Client) Health(ctx context.Context) error {
 	u, err := c.baseURL.Parse("health")
