@@ -174,7 +174,7 @@ func resolveConfig() (host string, httpPort int) {
 	if host == "" {
 		host = "http://127.0.0.1"
 	}
-	httpPort = parseEnvInt("CASPER_HTTP_PORT", 8080)
+	httpPort = parseEnvInt("CASPER_HTTP_PORT", 7222)
 	return host, httpPort
 }
 

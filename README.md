@@ -39,7 +39,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	client, err := casper.New("http://127.0.0.1", 8080)
+	client, err := casper.New("http://127.0.0.1", 7222)
 	if err != nil {
 		log.Fatalf("failed to create Casper client: %v", err)
 	}
