@@ -18,9 +18,10 @@ import casper "github.com/casper-vdb/go-client"
 
 ### Quick start
 
-The example below mirrors `examples/main.go` and demonstrates: collection
-management, batch upsert, HNSW index creation, search, reading and deleting
-vectors.
+The example below is a shorter version of `examples/main.go` and demonstrates:
+creating a collection with its index schema, writing vectors, starting
+indexing and waiting for it, search, scores, reading a vector and deleting the
+collection.
 
 ```go
 package main
@@ -39,7 +40,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	client, err := casper.New("http://127.0.0.1", 7222)
+	// APIKey is needed only when the server has API keys configured.
+	client, err := casper.NewWithOptions("http://127.0.0.1", 7222, casper.Options{
+		APIKey: "my-api-key",
+	})
 	if err != nil {
 		log.Fatalf("failed to create Casper client: %v", err)
 	}
@@ -51,64 +55,67 @@ func main() {
 	const collection = "example_collection"
 	const dim = 128
 
-	// Create collection
-	if err := client.CreateCollection(ctx, collection, casper.CreateCollectionRequest{
+	// Create the collection with the schema of its index. Storage is
+	// optional; every setting left out keeps its default.
+	norm := true
+	created, err := client.CreateCollection(ctx, collection, casper.CreateCollectionRequest{
 		Dim:     dim,
 		MaxSize: 10_000,
-	}); err != nil {
+		Index: casper.IndexSpec{
+			HNSW: casper.HNSW{
+				Metric:         "inner-product",
+				Quantization:   "f32",
+				M:              16,
+				M0:             32,
+				EfConstruction: 200,
+			},
+			Normalization: &norm,
+		},
+	})
+	if err != nil {
 		log.Fatalf("create collection failed: %v", err)
 	}
+	log.Printf("collection id: %s", created.ID)
 
-	// Upsert vectors (batch)
-	upserts := make([]casper.VectorPoint, 0, 5)
-	for id := uint32(1); id <= 5; id++ {
-		upserts = append(upserts, casper.VectorPoint{ID: id, Vector: genVec(dim)})
-	}
-	if err := client.UpsertVectors(ctx, collection, upserts); err != nil {
-		log.Fatalf("upsert vectors failed: %v", err)
-	}
-
-	// Mixed insert + delete
-	var batch []casper.BatchInsertOperation
-	for id := uint32(6); id <= 10; id++ {
-		batch = append(batch, casper.BatchInsertOperation{ID: id, Vector: genVec(dim)})
+	// Write: upserts and deletes in one batch.
+	var upserts []casper.UpsertOperation
+	for id := uint64(1); id <= 10; id++ {
+		upserts = append(upserts, casper.UpsertOperation{ID: id, Vector: genVec(dim)})
 	}
 	if err := client.BatchUpdate(ctx, collection, casper.BatchUpdateRequest{
-		Insert: batch,
-		Delete: []uint32{},
+		Upserts: upserts,
+		Delete:  []uint64{},
 	}); err != nil {
 		log.Fatalf("batch update failed: %v", err)
 	}
 
-	// Create HNSW index (build runs asynchronously on the server)
-	norm := true
-	if err := client.CreateHNSWIndex(ctx, collection, casper.HNSWIndex{
-		HNSW: casper.HNSW{
-			Metric:         "inner-product",
-			Quantization:   "i8",
-			M:              16,
-			M0:             32,
-			EfConstruction: 200,
-		},
-		Normalization: &norm,
-	}); err != nil {
-		log.Fatalf("create HNSW index failed: %v", err)
+	// Start indexing (the build runs asynchronously on the server) and wait
+	// until index.state is ready. Back at not_started means the build failed.
+	if err := client.StartIndexing(ctx, collection); err != nil {
+		log.Fatalf("start indexing failed: %v", err)
 	}
-
-	// Poll until the index is ready before searching.
-	for {
+	for ready := false; !ready; {
 		info, err := client.GetCollection(ctx, collection)
 		if err != nil {
 			log.Fatalf("get collection failed: %v", err)
 		}
-		if info.HasIndex {
-			break
+		switch info.Index.State {
+		case casper.IndexStateReady:
+			ready = true
+			continue
+		case casper.IndexStateNotStarted:
+			log.Fatalf("index build failed")
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			log.Fatalf("index not ready: %v", ctx.Err())
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 
 	// Search
-	results, err := client.Search(ctx, collection, genVec(dim), 30)
+	query := genVec(dim)
+	results, err := client.Search(ctx, collection, query, 5)
 	if err != nil {
 		log.Fatalf("search failed: %v", err)
 	}
@@ -116,8 +123,25 @@ func main() {
 		log.Printf("  %d. id=%d score=%f", i+1, r.ID, r.Score)
 	}
 
-	// Cleanup
-	_ = client.DeleteIndex(ctx, collection)
+	// Scores of the same query against chosen ids
+	scores, err := client.Scores(ctx, collection, query, []uint64{1, 2, 3})
+	if err != nil {
+		log.Fatalf("scores failed: %v", err)
+	}
+	for _, r := range scores {
+		log.Printf("  id=%d score=%f", r.ID, r.Score)
+	}
+
+	// Read a vector back: nil means the id is not in the index.
+	v, err := client.GetVector(ctx, collection, 1)
+	if err != nil {
+		log.Fatalf("get vector failed: %v", err)
+	}
+	if v != nil {
+		log.Printf("vector 1 has %d components", len(v.Vector.F32))
+	}
+
+	// Cleanup (the index goes with its collection)
 	_ = client.DeleteCollection(ctx, collection)
 }
 
@@ -138,14 +162,18 @@ func genVec(dim int) []float32 {
 
 ### Features
 
-The Go client covers all public HTTP endpoints exposed by the current Casper API:
+The Go client covers the current Casper HTTP API (server 0.2.0):
 
-- **Collections**: create, delete, list, get info.
-- **Vectors**: `UpsertVectors` (batch PUT), `DeleteVectors` (batch by id), `BatchUpdate` (mixed insert+delete), `GetVector`.
-- **Mute / unmute**: `MuteCollection`, `UnmuteCollection`.
-- **Indexes**: `CreateHNSWIndex` (async build — server returns 202), `DeleteIndex`.
-- **Search**: `Search`, `SearchWithEf` (overrides the HNSW `ef_search` parameter). The binary search response format is decoded automatically.
-- **Health**: `/health` liveness/readiness endpoint.
+- **Collections**: `CreateCollection` (with the index schema and policy; returns the collection's id), `DeleteCollection`, `ListCollections` (names only), `GetCollection` (details, WAL counters, snapshot counters, the index's state, schema and policy).
+- **Vectors**: `BatchUpdate` (the one write: upserts and deletes in one batch), `GetVector` (the vector as the index stores it: `F32`, or `I8` quantized components for an i8 index; nil when the id is absent). Ids are `uint64`.
+- **Indexes**: `StartIndexing` (async build — server returns 202; poll `GetCollection(..).Index.State`), `UpdateIndexPolicy` (change the snapshot/compaction policy, before indexing starts as well), `TriggerSnapshot`, `TriggerCompaction`. An index lives until its collection is deleted.
+- **Search**: `Search`, `SearchWithEf` (overrides the HNSW `ef_search` parameter), `Scores` (the query's score against chosen ids). The binary response format is decoded automatically.
+- **Cluster**: `GetCluster` (role, Raft state, membership with published addresses), `RemovePeer` (send to the leader), `SetTransferLimit` (in memory until restart).
+- **Configuration**: `GetConfig` (the node's startup configuration, grouped as in the config file).
+- **Metrics**: `GetMetrics` (Prometheus text format, returned as a string).
+- **Health**: `Health` (`/health`, liveness) and `Ready` (`/readyz`, readiness; optionally also requires the node to count for quorum).
+- **Auth**: `Options.APIKey` is sent as the `api-key` header.
+- **Errors**: every failure is a `*casper.Error` with a `Kind` per status code; a request that got no answer (connection refused, timeout, cancelled context) is `ErrorKindTransport`. A mutation sent to a cluster node that is not the leader fails with `ErrorKindNotLeader` and `LeaderAddr` naming the leader; `429` and `503` carry the server's `Retry-After` in `RetryAfter`. The client never retries on its own.
 
 ## License
 
